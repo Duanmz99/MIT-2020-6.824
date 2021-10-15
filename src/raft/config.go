@@ -315,6 +315,7 @@ func (cfg *config) checkOneLeader() int {
 
 		lastTermWithLeader := -1
 		for term, leaders := range leaders {
+			// 查看各个term里是否会出现leader多于一个的情况
 			if len(leaders) > 1 {
 				cfg.t.Fatalf("term %d has %d (>1) leaders", term, len(leaders))
 			}
@@ -322,7 +323,7 @@ func (cfg *config) checkOneLeader() int {
 				lastTermWithLeader = term
 			}
 		}
-
+		// 查看多个term后是否会出现leader
 		if len(leaders) != 0 {
 			return leaders[lastTermWithLeader][0]
 		}

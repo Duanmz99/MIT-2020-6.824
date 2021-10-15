@@ -76,6 +76,7 @@ func TestReElection2A(t *testing.T) {
 	cfg.checkNoLeader()
 
 	// if a quorum arises, it should elect a leader.
+	DPrintf("Check two server can choose a leader")
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 
@@ -95,11 +96,12 @@ func TestBasicAgree2B(t *testing.T) {
 
 	iters := 3
 	for index := 1; index < iters+1; index++ {
+		// 开始对应index处不应该有任何日志记录
 		nd, _ := cfg.nCommitted(index)
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
-
+		// 调用start在里面创建日志记录，日志内容为index*100,并等待一段时间观察是否全部日志都已通过心跳发送到follower
 		xindex := cfg.one(index*100, servers, false)
 		if xindex != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)
