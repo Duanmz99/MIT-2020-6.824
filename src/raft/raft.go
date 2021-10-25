@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sort"
 	"sync"
@@ -25,9 +27,7 @@ import (
 )
 import "sync/atomic"
 import "../labrpc"
-
-// import "bytes"
-// import "../labgob"
+import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -124,11 +124,19 @@ func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
+	//e := labgob.NewEncoder(w)
+	//e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+
 }
 
 //
@@ -151,6 +159,13 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewReader(data)
+	d := labgob.NewDecoder(r)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logs)
 }
 
 //
@@ -185,8 +200,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 //
@@ -212,6 +229,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.role = Follower
 		rf.votedFor = -1
 		rf.leaderId = -1
+		rf.persist()
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		// 包含了candidateId情况可能是为了保证丢包时可以得到相同回应
@@ -243,6 +261,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}()
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	reply.ConflictIndex = -1
+	reply.ConflictIndex = -1
 	// partA暂时用不上这里的更新，后续有需要再进行修改
 	// 检验1
 	if args.Term < rf.currentTerm {
@@ -253,6 +273,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.leaderId = -1
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 	// 一样的话无需像RequestVote一样进行一致性判断，直接进行状态更新即可
 	rf.leaderId = args.LeaderId
@@ -261,10 +282,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 检验2：最后一条日志对不上的情况
 	// 本地没有前一条日志
 	if len(rf.logs) < args.PrevLogIndex {
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = -1
 		return
 	}
 	// 本地有前一条日志但是对不上
 	if args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.logs[args.PrevLogIndex-1].Term
+		for index, _ := range rf.logs {
+			if rf.logs[index].Term == reply.ConflictTerm {
+				reply.ConflictIndex = index + 1
+				break
+			}
+		}
 		return
 	}
 	// 操作3，4
@@ -281,6 +311,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 	}
+	rf.persist()
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit > len(rf.logs) {
 			rf.commitIndex = len(rf.logs)
@@ -289,7 +320,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	reply.Success = true
-	rf.persist()
 	return
 }
 
@@ -488,6 +518,10 @@ func (rf *Raft) startAppend() {
 			LeaderCommit: rf.commitIndex,
 			PrevLogIndex: rf.nextIndex[index] - 1, // 检查是否之前的记录能对上
 		}
+		if args.PrevLogIndex > len(rf.logs) {
+			fmt.Printf("leader:%d\n", rf.me)
+			fmt.Printf("args.prevLogIndex:%+v,len rf.logs %d\n", rf.nextIndex, len(rf.logs))
+		}
 		if args.PrevLogIndex > 0 {
 			args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term // 检查是否之前的记录能对上，保证了一致性
 		}
@@ -516,8 +550,20 @@ func (rf *Raft) startAppend() {
 				if reply.Success {
 					// 同步逻辑成功
 					// 更新matchIndex和nextIndex，并尝试更新commitIndex
-					rf.nextIndex[server] += len(args.Entries)
+					k := rf.nextIndex[server]
+					// 这里需要按照args的信息进行更新而不是直接更新，以防止因为网络延迟出现重复添加的问题
+					// rf.nextIndex[server] += len(args.Entries)
+					rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 					rf.matchIndex[server] = rf.nextIndex[server] - 1
+					// used to debug with go test -run TestFigure8Unreliable2C
+					if rf.nextIndex[server] > len(rf.logs)+1 {
+						fmt.Printf("nextIndex now:%d\n", k)
+						fmt.Printf("leader:%d server:%d \n", rf.me, server)
+						fmt.Printf("args info\n")
+						fmt.Printf("Term %d, LeaderId:%d PrevLogIndex:%d PrevLogTerm:%d Entries Length:%d LeaderCommit:%d\n", args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit)
+						fmt.Printf("reply:%+v\n", reply)
+						fmt.Printf("4 leader:%d server:%d next index %d is bigger than rf.logs %d\n", rf.me, server, rf.nextIndex[server], len(rf.logs))
+					}
 					DPrintf("RaftNode[%d] send append request to server：%d with nextIndex %d\n", rf.me, server, rf.nextIndex[server])
 					// 排序寻找中位数，这里有奇数个peer，故大于等于中位数的必定会占一半以上
 					sortedMatchIndex := make([]int, 0)
@@ -538,7 +584,35 @@ func (rf *Raft) startAppend() {
 					}
 				} else {
 					// 同步失败，需要减小返回值
-					rf.nextIndex[server] -= 1
+					// rf.nextIndex[server] -= 1
+					// 效率优化版
+					if reply.ConflictTerm == -1 {
+						// 没有对应的prevIndex
+						rf.nextIndex[server] = reply.ConflictIndex + 1
+						if reply.ConflictIndex+1 > len(rf.logs) {
+							fmt.Printf("1 next index %d is bigger than rf.logs %d\n", reply.ConflictIndex+1, len(rf.logs))
+						}
+					} else {
+						// 有对应的prevIndex，但是term对不上
+						lastIndex := -1
+						for i := args.PrevLogIndex; i >= 1; i-- {
+							if rf.logs[i-1].Term == reply.ConflictTerm {
+								lastIndex = i
+								break
+							}
+						}
+						if lastIndex != -1 {
+							rf.nextIndex[server] = lastIndex + 1
+							if lastIndex+1 > len(rf.logs) {
+								fmt.Printf("2 next index %d is bigger than rf.logs %d\n", lastIndex+1, len(rf.logs))
+							}
+						} else {
+							rf.nextIndex[server] = reply.ConflictIndex
+							if reply.ConflictIndex > len(rf.logs) {
+								fmt.Printf("3 next index %d is bigger than rf.logs %d\n", reply.ConflictIndex, len(rf.logs))
+							}
+						}
+					}
 					if rf.nextIndex[server] < 1 {
 						rf.nextIndex[server] = 1
 					}
